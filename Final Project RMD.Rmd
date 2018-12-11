@@ -1,0 +1,319 @@
+---
+title: "Final Project FE 513"
+author: "Francesco Fabozzi"
+date: "12/9/2018"
+output: pdf_document
+---
+
+# Information for you guys before looking at code
+
+- Look at @BitmexRekt account on twitter and the progress report created previously. This will give better idea of project.
+    - Bitmex is an exchange that offers high leverage in Bitcoin market. The idea is that the liquidations on this exchange will affect the prices on another exchange. Thus, we can use the tweets about liquidations on the Bitmex exchange to find profit opportunities on another exchange. 
+
+- We use the Bitstamp exchange as our "trading exchange." i.e. we use the price data from the Bitstamp exchange. We use 15 minute price data.
+
+- The models use the tweet information from time T1 to predict the price movement in the next 15 minute period (T2). 
+
+- Overall: the models did not classify well, but the profits from trading were still pretty good. The inferences from this can be found below (around line 193).
+
+
+I try to guide you through the analysis as much as possible through the comments and text found below. If you guys have any questions or concerns just ask me. Make sure to take the time to really understand what we are doing here. 
+
+
+# Scrape twitter data using TwitteR api
+
+I will add this part later. Due to scraping limits, I had to gather twitter data over the course of a few days.
+
+```{r}
+### I WILL IMPLEMENT THIS LATER
+library(twitteR)
+```
+
+First we want to get the tweets about xbtusd because there are a few other currencies that appear in the tweets from the twitter bot.
+
+```{r}
+load("/Users/francescofabozzi/Documents/Stevens/FE582 (Fin Data Science)/Final Project/Final Project/Test Final/finaldataset.rData")
+
+tweets$text <- tolower(tweets$text)
+
+# find indices of tweets about xbtusd
+xbt.index <- grep("xbtusd", tweets$text)
+# subset
+tweets <- tweets[xbt.index, ]
+
+```
+
+Now we want to find the quantity liquidated because it will be used as a feature in our model.
+
+```{r}
+# quantity always appears before an "@" symbol, so look for that pattern
+value.index <- gregexpr("@", tweets$text)
+
+begin <- unlist(value.index) -13
+
+quantity <- substr(tweets$text, start = begin, stop = value.index)
+quantity <- gsub("@", "", quantity)
+quantity <- gsub(",", "", quantity)
+quantity <- as.numeric(gsub("[^0-9]", "", quantity))
+```
+
+
+Now we actually clean the tweets to put into a document term matrix for the model
+
+```{r}
+library(tm)
+library(SnowballC)
+corp <- VCorpus(VectorSource(tweets$text))
+corp <- tm_map(corp, removePunctuation)
+corp <- tm_map(corp, content_transformer( 
+              function(x) iconv(x, "latin1", "ASCII", sub=""))) ## gets rid of emojis and what not
+corp <- tm_map(corp, removeNumbers)
+corp <- tm_map(corp, removeWords, stopwords(kind = "en")) # remove english stopwords
+corp <- tm_map(corp, stemDocument) # stem the remaining terms
+corp <- tm_map(corp, stripWhitespace) 
+# create dtm
+dtm <- DocumentTermMatrix(corp)
+
+# we dont want that many words in our dataset because the tweet format is pretty standard
+dtm <- removeSparseTerms(dtm, sparse = 0.98)
+dtm <- as.matrix(dtm)
+```
+
+
+
+# Clean price data
+
+load the price data I sent you
+
+This comments in this part of the code are important because it explains some necessary parts of the study
+
+```{r}
+library(gdata)
+prices <- read.xls("/Users/francescofabozzi/Documents/Stevens/FE582 (Fin Data Science)/Final Project/Final Project/Test Final/newbtc 15min.xlsx", header = TRUE)
+
+## we want to subset for the close prices in each 15 min period
+prices <- prices[,c(1,3)]
+
+# calculate returns
+n <- nrow(prices)
+# however, we want to append the returns from the period after the current time period
+# this is because we want to predict the price in the next period, so the model must train
+# on the next period returns
+# thus, tweets from T1 will be associated with the return from T2 (i.e. price at time (t3 - t2)/t2)
+prices$return <- c((prices[3:n,2] - prices[2:(n-1),2] )/prices[2:(n-1),2],0,0) 
+# the zeros at the end are just to keep object lengths the same
+
+# convert price dates to format consistent with the tweet times
+prices[,1] <- as.character(as.POSIXct(prices[,1],"%Y-%m-%d %H:%M:%S", tz = "UTC"))
+
+```
+
+Now we want to combine the prices with the document term matrix we made earlier. 
+
+Code comments in this part are also important
+
+```{r}
+library(lubridate)
+## important: we round the tweet times up to the next 15 minute period so we know which tweets are associated with which returns 
+new.dates <- ceiling_date(ymd_hms(tweets$created), "15 min")
+
+# this table is just to combine dtm and price vector (we also add the quantity found earlier)
+merge.table <- cbind(as.character(new.dates), dtm,quantity)
+colnames(merge.table)[1] <- 'timestamp'
+
+library(dplyr)
+merge.table <- as.data.frame(merge.table)
+
+# IMPORTANT: we sum the term frequencies to get the aggregate term frequency within the 15 minute period 
+data <- aggregate(.~timestamp, merge.table, sum)
+
+# now we want to join the price data with the tweet data above, matching the dates
+data <- left_join(data, prices, by = "timestamp" )
+## this dataframe is the data that will be used in the model
+
+# convert liquidation quantity to log because it works better as model predictor
+data$quantity <- log(data$quantity)
+
+```
+
+Now we create the labels for the model because we are using clasification. "Rec" is the trading recommendation based on the returns from the next 15 minute period.
+
+We set a return threshold of 0.0005 for buys and sells. (i.e. buy if greater than 0.005 and sell if below -0.005). Hold if inbetween. 
+
+```{r}
+### create labels
+rec = vector()
+for (i in 1:nrow(data)) {
+  if (data$return[i] >= 0.0005) {
+    rec[i] = "buy"
+  } else if (data$return[i] <= -0.0005) {
+    rec[i] = "sell"
+  } else{
+    rec[i] = "hold"
+  }
+}
+
+# this shows the split for buys, sells, and holds 
+length(which(rec=='buy'))
+length(which(rec=='hold'))
+length(which(rec=='sell'))
+
+### This section of the code is just to create a dataframe that we can use to find the returns for calculating trading profits
+index <- which(as.character(data$timestamp) %in% as.character(prices[,1]))
+trading.t1 <- prices[c(unlist(index) + 1),2]
+trading.t2 <- prices[c(unlist(index)+2),2]
+trading.info <- cbind(trading.t1,trading.t2,prices[index,3])
+
+# now we want to get rid of the timestamp, prices, and return columns so that our model does not train on this information
+data <- data[,-c(1,21,22)]
+
+# combine the recommendations (i.e. labels that be used for classification) with the twitter data
+data <- cbind(data,rec)
+```
+
+
+Now we are ready to train and test our models. Split up training and test set
+
+
+```{r}
+# split into training and test sets
+library(caTools)
+set.seed(100)
+
+train.index <- sample.split(data, SplitRatio = 3/5)
+
+train <- data[train.index,]
+test <- data[!train.index,]
+```
+
+
+The following code sections are for the models that we use. In the study, it will be important to comment on the fact that our models had poor classification accuracy. Initially, this was very discouraging.
+
+However, as you will see, the profits generated from the models were pretty good. What this tells us is that when our model is wrong, it is not off by much (i.e. the losses aren't very high). When our models are correct, the profits are enough to outweigh the incorrect predictions.
+
+
+Some more information about models:
+- LDA had the highest cumulative profit but didn't have the best accuracy.
+- The KNN model had the best accuracy but had the lowest profit
+
+You can look at the other results for other inferences about each model.
+
+
+What need to be done for our conclusions/analysis:
+- Develop better plots for comparison for profits per transaction
+
+- Play around with the outputs of the profits.per.transactions to understand distributions and comment on how our profits outweigh our losses.
+
+- Maybe have a table of model performance information for each model so that we can compare at end.
+
+
+```{r}
+# Use lda model to classify buys, holds, sells
+lda.fit <- lda(rec~. , data = train)
+lda.pred <- predict(lda.fit, test)
+
+# model error rate
+1 - mean(test$rec == lda.pred$class)
+# confusion matrix
+table(test$rec ,lda.pred$class)
+
+
+
+# creating a function that will calculate cumulative profit based on $1 invested
+cumulative.profit <- function(model.pred){
+  profit <- 0
+  for (i in 1:length(model.pred)) {
+    if (model.pred[i] == 'buy'){
+      profit = profit + (1+profit)*trading.info[i,3]
+    } else if (model.pred[i] == 'sell'){
+      profit = profit - (1+profit)*trading.info[i,3]
+    } else {profit = profit + 0}
+  }
+  return(profit)
+}
+
+cumulative.profit(lda.pred$class)
+
+# now create a function that will calculate the return for each trade
+# this will be important because we're going to want to discuss the distribution of the individual returns
+# we need to make sure to discuss this because it's pretty interesting
+profit.per.transaction <- function(model.pred){
+  profit <- vector()
+  for (i in 1:length(lda.pred$class)) {
+    if (lda.pred$class[i] == 'buy') {
+      profit[i] = trading.info[i,3]
+    } else if (lda.pred$class[i] == 'sell'){
+      profit[i] = -1 *trading.info[i,3]
+    } else {profit = 0}
+  }
+  return(profit[!is.na(profit)])
+}  
+
+lda.prof <- profit.per.transaction(lda.pred$class)
+
+plot(lda.prof) 
+# notice there are more returns with positive profits than negative
+# furthermore, the positive profits are larger than the losses
+
+```
+
+```{r}
+# KNN model
+
+library(class)
+set.seed(100)
+train.knn = train[,-length(train) ]
+test.knn = test[, -length(test)]
+
+# find optimal k value
+x = seq(1,30, by = 1)
+
+k.test <- lapply(x, function(x) knn(train.knn,test.knn, train$rec, k = x))
+
+k.test.error <- as.data.frame(lapply(k.test, function(x) (1-mean(x == test$rec))))
+
+plot(x, k.test.error, type = 'b', main = "Error Rate versus K")
+
+# k = 21 is optimal value for knn model
+knn.pred <- knn(train.knn, test.knn, train$rec, k = 21)
+
+# confusion matrix
+table(test$rec, knn.pred)
+# error rate
+1- mean(test$rec == knn.pred)
+
+# run function for cumulative profit
+cumulative.profit(knn.fit)
+
+# run profit.per.transaction function
+profit.per.transaction(knn.fit)
+```
+
+```{r}
+library(randomForest)
+set.seed(1)
+
+rf <- randomForest(rec~., data = train, importance = TRUE)
+rf.pred <- predict(rf, newdata = test)
+
+1- mean(test$rec == rf.pred)
+
+cumulative.profit(rf.pred)
+
+```
+
+
+```{r}
+library(tree)
+set.seed(1)
+
+tree.fit <- tree(rec~.,data = train)
+tree.pred <- predict(tree.fit, test, type = 'class')
+
+1 - mean(tree.pred == test$rec)
+
+cumulative.profit(tree.pred)
+
+profit.per.transaction(tree.pred)
+
+```
